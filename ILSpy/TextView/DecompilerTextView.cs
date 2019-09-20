@@ -43,13 +43,14 @@ using ICSharpCode.AvalonEdit.Highlighting.Xshd;
 using ICSharpCode.AvalonEdit.Rendering;
 using ICSharpCode.AvalonEdit.Search;
 using ICSharpCode.Decompiler;
+using ICSharpCode.Decompiler.CSharp;
+using ICSharpCode.Decompiler.Documentation;
+using ICSharpCode.Decompiler.Metadata;
+using ICSharpCode.Decompiler.TypeSystem;
 using ICSharpCode.ILSpy.AvalonEdit;
 using ICSharpCode.ILSpy.Options;
 using ICSharpCode.ILSpy.TreeNodes;
-using ICSharpCode.ILSpy.XmlDoc;
-using ICSharpCode.NRefactory.Documentation;
 using Microsoft.Win32;
-using Mono.Cecil;
 
 namespace ICSharpCode.ILSpy.TextView
 {
@@ -63,6 +64,8 @@ namespace ICSharpCode.ILSpy.TextView
 		readonly ReferenceElementGenerator referenceElementGenerator;
 		readonly UIElementGenerator uiElementGenerator;
 		List<VisualLineElementGenerator> activeCustomElementGenerators = new List<VisualLineElementGenerator>();
+		RichTextColorizer activeRichTextColorizer;
+		BracketHighlightRenderer bracketHighlightRenderer;
 		FoldingManager foldingManager;
 		ILSpyTreeNode[] decompiledNodes;
 		
@@ -85,17 +88,30 @@ namespace ICSharpCode.ILSpy.TextView
 						}
 					}
 				});
-			
+
+			HighlightingManager.Instance.RegisterHighlighting(
+				"C#", new string[] { ".cs" },
+				delegate {
+					using (Stream s = typeof(DecompilerTextView).Assembly.GetManifestResourceStream(typeof(DecompilerTextView), "CSharp-Mode.xshd")) {
+						using (XmlTextReader reader = new XmlTextReader(s)) {
+							return HighlightingLoader.Load(reader, HighlightingManager.Instance);
+						}
+					}
+				});
+
 			InitializeComponent();
 			
 			this.referenceElementGenerator = new ReferenceElementGenerator(this.JumpToReference, this.IsLink);
 			textEditor.TextArea.TextView.ElementGenerators.Add(referenceElementGenerator);
 			this.uiElementGenerator = new UIElementGenerator();
+			this.bracketHighlightRenderer = new BracketHighlightRenderer(textEditor.TextArea.TextView);
 			textEditor.TextArea.TextView.ElementGenerators.Add(uiElementGenerator);
 			textEditor.Options.RequireControlModifierForHyperlinkClick = false;
 			textEditor.TextArea.TextView.MouseHover += TextViewMouseHover;
 			textEditor.TextArea.TextView.MouseHoverStopped += TextViewMouseHoverStopped;
-			textEditor.TextArea.TextView.MouseDown += TextViewMouseDown;
+			textEditor.TextArea.PreviewMouseDown += TextAreaMouseDown;
+			textEditor.TextArea.PreviewMouseUp += TextAreaMouseUp;
+			textEditor.TextArea.Caret.PositionChanged += HighlightBrackets;
 			textEditor.SetBinding(Control.FontFamilyProperty, new Binding { Source = DisplaySettingsPanel.CurrentDisplaySettings, Path = new PropertyPath("SelectedFont") });
 			textEditor.SetBinding(Control.FontSizeProperty, new Binding { Source = DisplaySettingsPanel.CurrentDisplaySettings, Path = new PropertyPath("SelectedFontSize") });
 			textEditor.SetBinding(TextEditor.WordWrapProperty, new Binding { Source = DisplaySettingsPanel.CurrentDisplaySettings, Path = new PropertyPath("EnableWordWrap") });
@@ -114,7 +130,6 @@ namespace ICSharpCode.ILSpy.TextView
 			SearchPanel.Install(textEditor.TextArea)
 				.RegisterCommands(Application.Current.MainWindow.CommandBindings);
 			
-			// Bookmarks context menu
 			ShowLineMargin();
 			
 			// add marker service & margin
@@ -165,10 +180,12 @@ namespace ICSharpCode.ILSpy.TextView
 
 		void TextViewMouseHover(object sender, MouseEventArgs e)
 		{
-			TextViewPosition? position = textEditor.TextArea.TextView.GetPosition(e.GetPosition(textEditor.TextArea.TextView) + textEditor.TextArea.TextView.ScrollOffset);
+			TextViewPosition? position = GetPositionFromMousePosition();
 			if (position == null)
 				return;
 			int offset = textEditor.Document.GetOffset(position.Value.Location);
+			if (referenceElementGenerator.References == null)
+				return;
 			ReferenceSegment seg = referenceElementGenerator.References.FindSegmentsContaining(offset).FirstOrDefault();
 			if (seg == null)
 				return;
@@ -181,49 +198,68 @@ namespace ICSharpCode.ILSpy.TextView
 		
 		object GenerateTooltip(ReferenceSegment segment)
 		{
-			if (segment.Reference is Mono.Cecil.Cil.OpCode) {
-				Mono.Cecil.Cil.OpCode code = (Mono.Cecil.Cil.OpCode)segment.Reference;
-				string encodedName = code.Code.ToString();
-				string opCodeHex = code.Size > 1 ? string.Format("0x{0:x2}{1:x2}", code.Op1, code.Op2) : string.Format("0x{0:x2}", code.Op2);
+			if (segment.Reference is ICSharpCode.Decompiler.Disassembler.OpCodeInfo code) {
 				XmlDocumentationProvider docProvider = XmlDocLoader.MscorlibDocumentation;
 				if (docProvider != null){
-					string documentation = docProvider.GetDocumentation("F:System.Reflection.Emit.OpCodes." + encodedName);
+					string documentation = docProvider.GetDocumentation("F:System.Reflection.Emit.OpCodes." + code.EncodedName);
 					if (documentation != null) {
 						XmlDocRenderer renderer = new XmlDocRenderer();
-						renderer.AppendText(string.Format("{0} ({1}) - ", code.Name, opCodeHex));
+						renderer.AppendText($"{code.Name} (0x{code.Code:x}) - ");
 						renderer.AddXmlDocumentation(documentation);
 						return renderer.CreateTextBlock();
 					}
 				}
-				return string.Format("{0} ({1})", code.Name, opCodeHex);
-			} else if (segment.Reference is MemberReference) {
-				MemberReference mr = (MemberReference)segment.Reference;
-				// if possible, resolve the reference
-				if (mr is TypeReference) {
-					mr = ((TypeReference)mr).Resolve() ?? mr;
-				} else if (mr is MethodReference) {
-					mr = ((MethodReference)mr).Resolve() ?? mr;
-				}
-				XmlDocRenderer renderer = new XmlDocRenderer();
-				renderer.AppendText(MainWindow.Instance.CurrentLanguage.GetTooltip(mr));
+				return $"{code.Name} (0x{code.Code:x})";
+			} else if (segment.Reference is IEntity entity) {
+				return CreateTextBlockForEntity(entity);
+			} else if (segment.Reference is ValueTuple<PEFile, System.Reflection.Metadata.EntityHandle> unresolvedEntity) {
+				var typeSystem = new DecompilerTypeSystem(unresolvedEntity.Item1, unresolvedEntity.Item1.GetAssemblyResolver(), TypeSystemOptions.Default | TypeSystemOptions.Uncached);
 				try {
-					XmlDocumentationProvider docProvider = XmlDocLoader.LoadDocumentation(mr.Module);
-					if (docProvider != null) {
-						string documentation = docProvider.GetDocumentation(XmlDocKeyProvider.GetKey(mr));
-						if (documentation != null) {
-							renderer.AppendText(Environment.NewLine);
-							renderer.AddXmlDocumentation(documentation);
-						}
-					}
-				} catch (XmlException) {
-					// ignore
+					IEntity resolved = typeSystem.MainModule.ResolveEntity(unresolvedEntity.Item2);
+					if (resolved == null)
+						return null;
+					return CreateTextBlockForEntity(resolved);
+				} catch (BadImageFormatException) {
+					return null;
 				}
-				return renderer.CreateTextBlock();
 			}
 			return null;
 		}
+
+		static TextBlock CreateTextBlockForEntity(IEntity resolved)
+		{
+			XmlDocRenderer renderer = new XmlDocRenderer();
+			renderer.AppendText(MainWindow.Instance.CurrentLanguage.GetTooltip(resolved));
+			try {
+				if (resolved.ParentModule == null || resolved.ParentModule.PEFile == null)
+					return null;
+				var docProvider = XmlDocLoader.LoadDocumentation(resolved.ParentModule.PEFile);
+				if (docProvider != null) {
+					string documentation = docProvider.GetDocumentation(resolved.GetIdString());
+					if (documentation != null) {
+						renderer.AppendText(Environment.NewLine);
+						renderer.AddXmlDocumentation(documentation);
+					}
+				}
+			} catch (XmlException) {
+				// ignore
+			}
+			return renderer.CreateTextBlock();
+		}
 		#endregion
-		
+
+		#region Highlight brackets
+		void HighlightBrackets(object sender, EventArgs e)
+		{
+			if (DisplaySettingsPanel.CurrentDisplaySettings.HighlightMatchingBraces) {
+				var result = MainWindow.Instance.CurrentLanguage.BracketSearcher.SearchBracket(textEditor.Document, textEditor.CaretOffset);
+				bracketHighlightRenderer.SetHighlight(result);
+			} else {
+				bracketHighlightRenderer.SetHighlight(null);
+			}
+		}
+		#endregion
+
 		#region RunWithCancellation
 		/// <summary>
 		/// Switches the GUI into "waiting" mode, then calls <paramref name="taskCreation"/> to create
@@ -360,6 +396,14 @@ namespace ICSharpCode.ILSpy.TextView
 			references = textOutput.References;
 			definitionLookup = textOutput.DefinitionLookup;
 			textEditor.SyntaxHighlighting = highlighting;
+			textEditor.Options.EnableEmailHyperlinks = textOutput.EnableHyperlinks;
+			textEditor.Options.EnableHyperlinks = textOutput.EnableHyperlinks;
+			if (activeRichTextColorizer != null)
+				textEditor.TextArea.TextView.LineTransformers.Remove(activeRichTextColorizer);
+			if (textOutput.HighlightingModel != null) {
+				activeRichTextColorizer = new RichTextColorizer(textOutput.HighlightingModel);
+				textEditor.TextArea.TextView.LineTransformers.Insert(highlighting == null ? 0 : 1, activeRichTextColorizer);
+			}
 			
 			// Change the set of active element generators:
 			foreach (var elementGenerator in activeCustomElementGenerators) {
@@ -488,35 +532,16 @@ namespace ICSharpCode.ILSpy.TextView
 			
 			Thread thread = new Thread(new ThreadStart(
 				delegate {
-					#if DEBUG
-					if (System.Diagnostics.Debugger.IsAttached) {
-						try {
-							AvalonEditTextOutput textOutput = new AvalonEditTextOutput();
-							textOutput.LengthLimit = outputLengthLimit;
-							DecompileNodes(context, textOutput);
-							textOutput.PrepareDocument();
-							tcs.SetResult(textOutput);
-						} catch (OutputLengthExceededException ex) {
-							tcs.SetException(ex);
-						} catch (AggregateException ex) {
-							tcs.SetException(ex.InnerExceptions);
-						} catch (OperationCanceledException) {
-							tcs.SetCanceled();
-						}
-					} else
-						#endif
-					{
-						try {
-							AvalonEditTextOutput textOutput = new AvalonEditTextOutput();
-							textOutput.LengthLimit = outputLengthLimit;
-							DecompileNodes(context, textOutput);
-							textOutput.PrepareDocument();
-							tcs.SetResult(textOutput);
-						} catch (OperationCanceledException) {
-							tcs.SetCanceled();
-						} catch (Exception ex) {
-							tcs.SetException(ex);
-						}
+					try {
+						AvalonEditTextOutput textOutput = new AvalonEditTextOutput();
+						textOutput.LengthLimit = outputLengthLimit;
+						DecompileNodes(context, textOutput);
+						textOutput.PrepareDocument();
+						tcs.SetResult(textOutput);
+					} catch (OperationCanceledException) {
+						tcs.SetCanceled();
+					} catch (Exception ex) {
+						tcs.SetException(ex);
 					}
 				}));
 			thread.Start();
@@ -551,7 +576,7 @@ namespace ICSharpCode.ILSpy.TextView
 			output.WriteLine();
 			if (wasNormalLimit) {
 				output.AddButton(
-					Images.ViewCode, "Display Code",
+					Images.ViewCode, Properties.Resources.DisplayCode,
 					delegate {
 						DoDecompile(context, ExtendedOutputLengthLimit).HandleExceptions();
 					});
@@ -559,7 +584,7 @@ namespace ICSharpCode.ILSpy.TextView
 			}
 			
 			output.AddButton(
-				Images.Save, "Save Code",
+				Images.Save, Properties.Resources.SaveCode,
 				delegate {
 					SaveToDisk(context.Language, context.TreeNodes, context.Options);
 				});
@@ -580,7 +605,7 @@ namespace ICSharpCode.ILSpy.TextView
 					foreach (var r in references) {
 						if (reference.Equals(r.Reference)) {
 							var mark = textMarkerService.Create(r.StartOffset, r.Length);
-							mark.BackgroundColor = r.IsLocalTarget ? Colors.LightSeaGreen : Colors.GreenYellow;
+							mark.BackgroundColor = r.IsDefinition ? Colors.LightSeaGreen : Colors.GreenYellow;
 							localReferenceMarks.Add(mark);
 						}
 					}
@@ -603,12 +628,36 @@ namespace ICSharpCode.ILSpy.TextView
 			MainWindow.Instance.JumpToReference(reference);
 		}
 
-		void TextViewMouseDown(object sender, MouseButtonEventArgs e)
-		{
-			if (GetReferenceSegmentAtMousePosition() == null)
-				ClearLocalReferenceMarks();
-		}
+		Point? mouseDownPos;
 
+		void TextAreaMouseDown(object sender, MouseButtonEventArgs e)
+		{
+			mouseDownPos = e.GetPosition(this);
+		}
+		
+		void TextAreaMouseUp(object sender, MouseButtonEventArgs e)
+		{
+			if (mouseDownPos == null)
+				return;
+			Vector dragDistance = e.GetPosition(this) - mouseDownPos.Value;
+			if (Math.Abs(dragDistance.X) < SystemParameters.MinimumHorizontalDragDistance
+				&& Math.Abs(dragDistance.Y) < SystemParameters.MinimumVerticalDragDistance
+				&& e.ChangedButton == MouseButton.Left)
+			{
+				// click without moving mouse
+				var referenceSegment = GetReferenceSegmentAtMousePosition();
+				if (referenceSegment == null) {
+					ClearLocalReferenceMarks();
+				} else if (referenceSegment.IsLocal || !referenceSegment.IsDefinition) {
+					JumpToReference(referenceSegment);
+					textEditor.TextArea.ClearSelection();
+				}
+				// cancel mouse selection to avoid AvalonEdit selecting between the new
+				// cursor position and the mouse position.
+				textEditor.TextArea.MouseSelectionMode = MouseSelectionMode.None;
+			}
+		}
+		
 		void ClearLocalReferenceMarks()
 		{
 			foreach (var mark in localReferenceMarks) {
@@ -622,7 +671,7 @@ namespace ICSharpCode.ILSpy.TextView
 		/// </summary>
 		bool IsLink(ReferenceSegment referenceSegment)
 		{
-			return true;
+			return referenceSegment.IsLocal || !referenceSegment.IsDefinition;
 		}
 		#endregion
 		
@@ -637,7 +686,7 @@ namespace ICSharpCode.ILSpy.TextView
 			
 			SaveFileDialog dlg = new SaveFileDialog();
 			dlg.DefaultExt = language.FileExtension;
-			dlg.Filter = language.Name + "|*" + language.FileExtension + "|All Files|*.*";
+			dlg.Filter = language.Name + "|*" + language.FileExtension + Properties.Resources.AllFiles;
 			dlg.FileName = CleanUpName(treeNodes.First().ToString()) + language.FileExtension;
 			if (dlg.ShowDialog() == true) {
 				SaveToDisk(new DecompilationContext(language, treeNodes.ToArray(), options), dlg.FileName);
@@ -693,18 +742,13 @@ namespace ICSharpCode.ILSpy.TextView
 						AvalonEditTextOutput output = new AvalonEditTextOutput();
 						output.WriteLine("Decompilation complete in " + stopwatch.Elapsed.TotalSeconds.ToString("F1") + " seconds.");
 						output.WriteLine();
-						output.AddButton(null, "Open Explorer", delegate { Process.Start("explorer", "/select,\"" + fileName + "\""); });
+						output.AddButton(null, Properties.Resources.OpenExplorer, delegate { Process.Start("explorer", "/select,\"" + fileName + "\""); });
 						output.WriteLine();
 						tcs.SetResult(output);
 					} catch (OperationCanceledException) {
 						tcs.SetCanceled();
-						#if DEBUG
-					} catch (AggregateException ex) {
-						tcs.SetException(ex);
-						#else
 					} catch (Exception ex) {
 						tcs.SetException(ex);
-						#endif
 					}
 				}));
 			thread.Start();
@@ -716,21 +760,14 @@ namespace ICSharpCode.ILSpy.TextView
 		/// </summary>
 		internal static string CleanUpName(string text)
 		{
-			int pos = text.IndexOf(':');
-			if (pos > 0)
-				text = text.Substring(0, pos);
-			pos = text.IndexOf('`');
-			if (pos > 0)
-				text = text.Substring(0, pos);
-			text = text.Trim();
-			foreach (char c in Path.GetInvalidFileNameChars())
-				text = text.Replace(c, '-');
-			return text;
+			return WholeProjectDecompiler.CleanUpFileName(text);
 		}
 		#endregion
 
 		internal ReferenceSegment GetReferenceSegmentAtMousePosition()
 		{
+			if (referenceElementGenerator.References == null)
+				return null;
 			TextViewPosition? position = GetPositionFromMousePosition();
 			if (position == null)
 				return null;
@@ -740,7 +777,13 @@ namespace ICSharpCode.ILSpy.TextView
 		
 		internal TextViewPosition? GetPositionFromMousePosition()
 		{
-			return textEditor.TextArea.TextView.GetPosition(Mouse.GetPosition(textEditor.TextArea.TextView) + textEditor.TextArea.TextView.ScrollOffset);
+			var position = textEditor.TextArea.TextView.GetPosition(Mouse.GetPosition(textEditor.TextArea.TextView) + textEditor.TextArea.TextView.ScrollOffset);
+			if (position == null)
+				return null;
+			var lineLength = textEditor.Document.GetLineByNumber(position.Value.Line).Length + 1;
+			if (position.Value.Column == lineLength)
+				return null;
+			return position;
 		}
 		
 		public DecompilerTextViewState GetState()
